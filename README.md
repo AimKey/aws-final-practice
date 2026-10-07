@@ -66,6 +66,7 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 
 cp .env.example .env             # then fill in real values
+alembic upgrade head             # apply database migrations
 uvicorn main:app --reload
 ```
 
@@ -126,13 +127,53 @@ The workflow is defined in `.github/workflows/ci-cd.yml`.
 - **Pull request to `main`:** runs the tests only.
 - **Push to `main`:** runs the tests, and if they pass, deploys to EC2.
 
-The deploy job connects to the instance over SSH and runs these steps:
+The `test` job also starts a PostgreSQL container and verifies the migrations by running `alembic upgrade head`, `alembic downgrade base`, and `alembic upgrade head`.
 
-1. `git pull --ff-only origin main`
-2. Write `.env` from the GitHub secrets
-3. `docker build --build-arg GIT_SHA=<commit> -t fastapi-app:local .`
-4. `docker compose up -d --remove-orphans`
-5. `docker image prune -f`
+After the tests pass, two more jobs run in sequence. Both connect to the instance over SSH.
+
+**`migrate` job**
+
+1. Remember the current commit and tag the running image as `fastapi-app:previous`
+2. `git pull --ff-only origin main`
+3. Back up `.env` to `.env.previous`, then write the new `.env` from the GitHub secrets
+4. `docker build --build-arg GIT_SHA=<commit> -t fastapi-app:local .`
+5. Record the current database revision, then run `alembic upgrade head`
+
+**`deploy` job** (runs only if `migrate` succeeded)
+
+1. `docker compose up -d --remove-orphans`
+2. Poll `/api/health` until it reports the new commit (up to about 60 seconds)
+3. `docker image prune -f`
+
+The state needed for a rollback (previous commit, previous database revision, whether a previous image exists) is saved on the instance in `.git/deploy_state` by the `migrate` job and read by the `deploy` job.
+
+### Database migrations
+
+Migrations use [Alembic](https://alembic.sqlalchemy.org/). The connection string is read from `DATABASE_URL`, and the scripts live in `migrations/versions/`. The project has no ORM models, so migrations are written by hand.
+
+```bash
+alembic revision -m "add users table"   # create a new migration, then edit upgrade() and downgrade()
+alembic upgrade head                    # apply all migrations
+alembic downgrade -1                    # revert the last migration
+alembic current                         # show the current revision
+```
+
+Always write a working `downgrade()`. The pipeline checks the full upgrade, downgrade, upgrade cycle on every run, and the rollback below depends on it.
+
+### Rollback strategy
+
+If any step after the `git pull` fails (build, migration, container start, or the health check), the failing job rolls back automatically and the workflow fails. A failure in `migrate` stops the workflow before `deploy` runs. The rollback does the following:
+
+1. Downgrade the database to the revision recorded before the deploy (using the new image, which contains the newer migrations).
+2. `git reset --hard` to the previous commit.
+3. Restore the previous `.env`.
+4. Retag `fastapi-app:previous` as `fastapi-app:local` and restart the container (only needed when it was already replaced, so the `migrate` job skips the restart).
+
+Limits to be aware of:
+
+- Rollback only reverts schema changes that have a correct `downgrade()`. Data removed by a downgrade (for example a dropped column) is not restored. For risky migrations, take an RDS snapshot first.
+- On the very first deploy there is no previous image, so the old container cannot be restored.
+- To roll back manually after a successful deploy, revert the commit on `main` and push. The pipeline then deploys the reverted code. For a database change, add a new migration instead of editing an applied one.
 
 ### Required GitHub Actions secrets
 
@@ -162,6 +203,7 @@ The deploy script expects the repository at `/home/ec2-user/aws-final-practice`.
 cd /home/ec2-user/aws-final-practice
 git pull --ff-only origin main
 docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" -t fastapi-app:local .
+docker compose run --rm -T api alembic upgrade head
 docker compose up -d --remove-orphans
 ```
 

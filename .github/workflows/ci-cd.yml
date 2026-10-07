@@ -8,11 +8,23 @@ on:
 
 concurrency:
   group: ci-cd-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -28,7 +40,15 @@ jobs:
       - name: Run tests
         run: pytest -q
 
-  deploy:
+      - name: Verify migrations (upgrade, downgrade, upgrade)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+  migrate:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -45,7 +65,7 @@ jobs:
           echo "::add-mask::$encoded"
           echo "b64=$encoded" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy to EC2
+      - name: Pull code, build image and run migrations on EC2
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -54,20 +74,108 @@ jobs:
           envs: GIT_SHA,ENV_B64,APP_DIR
           script_stop: true
           script: |
-            set -e
+            set -eo pipefail
 
             cd "$APP_DIR"
 
+            PREV_SHA=$(git rev-parse HEAD)
+            PREV_REV=""
+            HAS_PREV=0
+            rm -f .env.previous
+
+            rollback() {
+              trap - ERR
+              echo "Migration stage failed, rolling back to $PREV_SHA"
+              if [ -n "$PREV_REV" ]; then
+                docker compose run --rm -T api alembic downgrade "$PREV_REV" || true
+              fi
+              git reset --hard "$PREV_SHA"
+              if [ -f .env.previous ]; then
+                cp .env.previous .env
+              fi
+              if [ "$HAS_PREV" = 1 ]; then
+                docker tag fastapi-app:previous fastapi-app:local
+              fi
+              exit 1
+            }
+            trap rollback ERR
+
+            if docker image inspect fastapi-app:local > /dev/null 2>&1; then
+              docker tag fastapi-app:local fastapi-app:previous
+              HAS_PREV=1
+            fi
+
             git pull --ff-only origin main
 
+            if [ -f .env ]; then
+              cp .env .env.previous
+            fi
             printf '%s' "$ENV_B64" | base64 -d > .env
 
             docker build --build-arg GIT_SHA="$GIT_SHA" -t fastapi-app:local .
 
-            docker compose up -d --remove-orphans
+            PREV_REV=$(docker compose run --rm -T api alembic current | awk '{print $1; exit}')
+            PREV_REV=${PREV_REV:-base}
 
-            docker image prune -f
+            printf 'PREV_SHA=%s\nPREV_REV=%s\nHAS_PREV=%s\n' "$PREV_SHA" "$PREV_REV" "$HAS_PREV" > .git/deploy_state
+
+            docker compose run --rm -T api alembic upgrade head
+
+            trap - ERR
         env:
           GIT_SHA: ${{ github.sha }}
           ENV_B64: ${{ steps.env.outputs.b64 }}
+          APP_DIR: /home/ec2-user/aws-final-practice
+
+  deploy:
+    needs: migrate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restart containers on EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: GIT_SHA,APP_DIR
+          script_stop: true
+          script: |
+            set -eo pipefail
+
+            cd "$APP_DIR"
+
+            . .git/deploy_state
+
+            rollback() {
+              trap - ERR
+              echo "Deploy failed, rolling back to $PREV_SHA"
+              docker compose run --rm -T api alembic downgrade "$PREV_REV" || true
+              git reset --hard "$PREV_SHA"
+              if [ -f .env.previous ]; then
+                cp .env.previous .env
+              fi
+              if [ "$HAS_PREV" = 1 ]; then
+                docker tag fastapi-app:previous fastapi-app:local
+                docker compose up -d --remove-orphans
+              fi
+              exit 1
+            }
+            trap rollback ERR
+
+            docker compose up -d --remove-orphans
+
+            healthy=0
+            for i in $(seq 1 15); do
+              if curl -fsS http://localhost:8000/api/health | grep -q "\"commit\":\"${GIT_SHA:0:7}\""; then
+                healthy=1
+                break
+              fi
+              sleep 4
+            done
+            [ "$healthy" = 1 ]
+
+            trap - ERR
+            docker image prune -f
+        env:
+          GIT_SHA: ${{ github.sha }}
           APP_DIR: /home/ec2-user/aws-final-practice

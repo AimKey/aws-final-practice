@@ -2,7 +2,8 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
+COPY main.py alembic.ini .
+COPY migrations migrations
 ARG GIT_SHA=dev
 ENV GIT_SHA=$GIT_SHA
 EXPOSE 8000
