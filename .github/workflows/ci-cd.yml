@@ -1,0 +1,73 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare .env content
+        id: env
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          encoded=$(printf 'DATABASE_URL=%s\nS3_BUCKET_NAME=%s\nAWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$DATABASE_URL" "$S3_BUCKET_NAME" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" | base64 -w0)
+          echo "::add-mask::$encoded"
+          echo "b64=$encoded" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: GIT_SHA,ENV_B64,APP_DIR
+          script_stop: true
+          script: |
+            set -e
+
+            cd "$APP_DIR"
+
+            git pull --ff-only origin main
+
+            printf '%s' "$ENV_B64" | base64 -d > .env
+
+            docker build --build-arg GIT_SHA="$GIT_SHA" -t fastapi-app:local .
+
+            docker compose up -d --remove-orphans
+
+            docker image prune -f
+        env:
+          GIT_SHA: ${{ github.sha }}
+          ENV_B64: ${{ steps.env.outputs.b64 }}
+          APP_DIR: /home/ec2-user/aws-final-practice
