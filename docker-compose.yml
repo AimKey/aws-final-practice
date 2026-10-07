@@ -10,3 +10,10 @@ services:
       - .env
     ports:
       - "8000:8000"
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "ap-southeast-1"
+        awslogs-group: "/aws/ec2/fastapi-app"
+        awslogs-stream: "app"
+        awslogs-create-group: "true"
