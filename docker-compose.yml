@@ -1,0 +1,9 @@
+services:
+  api:
+    container_name: aws-fastapi
+    image: aimkey248/aws-final-fastapi:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
